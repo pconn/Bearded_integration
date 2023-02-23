@@ -85,6 +85,23 @@ for(i in 1:nrow(grid_sf)){
 grid_sf$depth[which(is.na(grid_sf$depth))]=0  #in case some cells 400 points were all on land
 #note depth truncated at 600m (deeper gets assigned 600m)
 
+#distance to land
+library(ptolemy) #from josh london's github
+bbox = st_union(grid_sf)
+Land_sf = extract_gshhg(
+  data=bbox,
+  resolution = "i",
+  epsg = NULL,
+  buffer = 5000,
+  simplify = FALSE,
+  warn = FALSE
+)
+grid_centroids = st_centroid(grid_sf)
+Distances=st_distance(grid_centroids,Land_sf,byid=TRUE)
+grid_sf$dist_land=apply(Distances,1,'min')/1000 #change to km
+
+
+
 save.image("format_analysis_grid1.RData")  #the depth calcs take a bit of time....might just want to load workspace if needed
 #load("format_analysis_grid1.RData")   #the above takes awhile; might want to load from here.
 
@@ -302,7 +319,7 @@ for(iyr in 1:n_yrs){
   }
 }
 
-save.image(file='analysis_grid_ice_kriged.RData')
+save.image(file='prediction_grid_ice_kriged.RData')
 
 
 #plot showing seasonal variability between years

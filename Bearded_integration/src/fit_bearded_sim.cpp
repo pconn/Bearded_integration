@@ -156,13 +156,11 @@ Type objective_function<Type>::operator() ()
     }
   }
   jnll_comp(0)=Wts(0)*jnll_comp(0);
-  jnll_comp(0)=0;
 
   //ckmr observation process
   //jnll_comp(1) = -Wts(1)*dnorm(log_N,log_ckmr_N,log_ckmr_se,1);  //log likelihood - normal on log-scale
   jnll_comp(1) = -dnorm(log_N,log_ckmr_N,Wts(1)*log_ckmr_se,1);  //log likelihood - normal on log-scale
-  jnll_comp(1) = 0;
-  
+
   //aerial survey counts
   vector<Type> log_E_N_2012(n_bering);
   vector<Type> log_E_N_2013(n_bering);

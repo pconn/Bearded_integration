@@ -22,6 +22,11 @@ pdf('hypo_grid_mooring.pdf')
  plot1
 dev.off()
 
+#now plot kernel
+png('hypo_grid_mooring.png')
+plot1
+dev.off()
+
 library(mvtnorm)
 
 set.seed(0)
@@ -38,4 +43,7 @@ persp(x1, x2, y, theta=-20, phi=20, col = 'blue',
       expand=0.8, ticktype='simple')
 dev.off()
 
-
+png('kernel_2d.png')
+persp(x1, x2, y, theta=-20, phi=20, col = 'blue',
+      expand=0.8, ticktype='simple')
+dev.off()

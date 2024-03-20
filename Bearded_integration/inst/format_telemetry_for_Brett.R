@@ -162,19 +162,37 @@ save.image(file='create_movement_rasters_ice_attached.RData')
 
 
 #krige ice data
-library(automap)
-grid_sp <- as(st_centroid(grid_sf),'Spatial')
+# library(automap)
+# grid_sp <- as(st_centroid(grid_sf),'Spatial')
+# Ice_smoothed=Ice
+# for(iyr in 1:n_yrs){
+#   for(iseason in 1:n_seasons){
+#     grid_sp$ice = Ice[,n_seasons*(iyr-1)+iseason]
+#     Which_problem = which(Ice[,n_seasons*(iyr-1)+iseason]>1.0 | grid_sf$land_cover>0.01)
+#     fit_points = grid_sp[-Which_problem,]
+#     pred_points = grid_sp[Which_problem,]
+#     krige_out=autoKrige(ice~1,input_data=fit_points,new_data=pred_points)$krige_output[["var1.pred"]]
+#     krige_out2=autoKrige(ice~1,input_data=fit_points,new_data=grid_sp)$krige_output[["var1.pred"]]
+#     if(sum(krige_out<0)>0){
+#       krige_out[which(krige_out<0)]=0
+#     }
+#     Ice[Which_problem,n_seasons*(iyr-1)+iseason]=krige_out
+#     Ice_smoothed[,n_seasons*(iyr-1)+iseason] = krige_out2
+#   }
+# }
+
+Ice_smoothed=Ice
+library(spmodel)
 for(iyr in 1:n_yrs){
   for(iseason in 1:n_seasons){
-    grid_sp$ice = Ice[,n_seasons*(iyr-1)+iseason]
-    Which_problem = which(Ice[,n_seasons*(iyr-1)+iseason]>1.0 | grid_sf$land_cover>0.01)
-    fit_points = grid_sp[-Which_problem,]
-    pred_points = grid_sp[Which_problem,]
-    krige_out=autoKrige(ice~1,input_data=fit_points,new_data=pred_points)$krige_output[["var1.pred"]] 
-    if(sum(krige_out<0)>0){
-      krige_out[which(krige_out<0)]=0
-    }
-    Ice[Which_problem,n_seasons*(iyr-1)+iseason]=krige_out
+    cat(paste0("iyr ",iyr," iseason ",iseason,"\n"))
+    grid_sf$ice = Ice[,n_seasons*(iyr-1)+iseason]
+    grid_model = grid_sf[which(grid_sf$ice<=1),]
+    grid_model$ice[which(grid_model$ice==0)]=0.001
+    grid_model$ice[which(grid_model$ice==1.0)]=0.999
+    #spmod_out <- spglm(ice~1,family="beta",local=1,data=grid_model,spcov_type="exponential")
+    spmod_out <- splm(ice~1,local=1,data=grid_model,spcov_type="exponential")
+    Ice_smoothed[,n_seasons*(iyr-1)+iseason] = predict(spmod_out, newdata = grid_sf, type="response")
   }
 }
 
@@ -184,11 +202,11 @@ save.image(file='analysis_grid_ice_kriged.RData')
 n_layers = n_yrs*n_seasons
 Raster_list = vector("list",n_layers)
 for(i in 1:n_layers){
-  grid_sf$ice=Ice[,i]
-  grid_sf$ice[which(grid_sf$ice>1)]=1
-  ice_sp = as(grid_sf[,"ice"],"Spatial")
+  grid_sf$pred_ice=Ice_smoothed[,i]
+  #grid_sf$ice[which(grid_sf$ice>1)]=1
+  ice_sp = as(grid_sf[,"pred_ice"],"Spatial")
   Raster_list[[i]]<-raster(ice_sp,res=25067.53)
-  Raster_list[[i]] =rasterize(ice_sp,Raster_list[[i]],field="ice")
+  Raster_list[[i]] =rasterize(ice_sp,Raster_list[[i]],field="pred_ice")
   Raster_list[[i]][is.na(Raster_list[[i]][])]=0
 }
 Ice_brick = brick(Raster_list)
@@ -223,7 +241,7 @@ for(irec in 1:nrow(BD_df)){
 }
 
 #save.image('data_for_Brett.RData')
-writeRaster(Ice_brick,"Ice_brick.grd",overwrite=T)
+writeRaster(Ice_brick,"Ice_brick_smoothed.grd",overwrite=T)
 writeRaster(dist_land_raster,"dist_land_raster.grd",overwrite=T)
 writeRaster(Northing_raster,"Northing_raster.grd",overwrite=T)
 writeRaster(Easting_raster,"Easting_raster.grd",overwrite=T)

@@ -79,9 +79,10 @@ Type objective_function<Type>::operator() ()
   DATA_MATRIX( X_acc );           // design matrix to explain variation in acoustic detections        
   DATA_SCALAR( log_ckmr_N );   // CKMR estimate (log scale)
   DATA_SCALAR( log_ckmr_se );  // standard error of CKMR estimate (log scale)
-  //DATA_MATRIX(UD_mean_adj);  // utilization distribution, standardized by divided by "mean_UD"
-  //DATA_SCALAR(mean_UD);  // for matching Pi_st with standardized UD
-  //DATA_MATRIX(W_st); // inverse variance for UD observations - used in weighted sum-of-squares
+  DATA_MATRIX(UD_mean_adj);  // utilization distribution, standardized by divided by "mean_UD"
+  DATA_SCALAR(mean_UD);  // for matching Pi_st with standardized UD
+  DATA_IVECTOR(which_tsteps_UD); //don't fit UDs from years with no data
+  DATA_MATRIX(W_st); // inverse variance for UD observations - used in weighted sum-of-squares
   DATA_IVECTOR( which_Bering );  //which cells of larger grid are part of the Bering Sea
   DATA_IVECTOR( which_Chukchi );  //which cells of larger grid are part of the Chukchi Sea
   DATA_IVECTOR( which_Beaufort );  //which cells of larger grid are part of the Chukchi Sea
@@ -104,14 +105,15 @@ Type objective_function<Type>::operator() ()
   DATA_IVECTOR( Sdims );   //Dimensions of each smooth
   DATA_MATRIX( X_s );  //design matrix associated with spline effects
   DATA_VECTOR( Wts );  //likelihood weights for composite likelihood. Order: UD, CKMR, Aerial, Acoustics
-  DATA_INTEGER( n_tsteps);  //number of time steps
+  DATA_INTEGER( n_tsteps);  //number of time steps (# number of years * # of seasons)
+  DATA_INTEGER( n_seasons);  //number of seasons per year
   DATA_INTEGER(est_acc); //only add in acoustic likelihood if est_acc=1
   // SPDE objects
   DATA_INTEGER( n_eta ); //mesh points in space mesh
   DATA_SPARSE_MATRIX ( M0 );
   DATA_SPARSE_MATRIX ( M1 );
   DATA_SPARSE_MATRIX ( M2 );
-  DATA_IVECTOR ( Eta_index );
+  DATA_SPARSE_MATRIX ( A ); //for predictive process model
   // normalization flag - used for speed -up
   DATA_INTEGER(flag); // flag == 0 => no data contribution added to jnll
   
@@ -143,6 +145,8 @@ Type objective_function<Type>::operator() ()
   int n_beta_acc = X_acc.row(0).size();
   int n_acc_det = Acc_n.col(0).size(); 
   int n_duty = Duty_lengths.size();
+  int n_tsteps_UD = which_tsteps_UD.size();
+  int n_yrs = n_tsteps/n_seasons;
 
   // global stuff
   vector<Type> jnll_comp(6);  //neg. log likelihood components: UD, CKMR, Aerial, Acoustics, spline prior
@@ -154,7 +158,7 @@ Type objective_function<Type>::operator() ()
   
   // Make spatial precision matrix
   SparseMatrix <Type > Q_ss = spde_Q( log_kappa , log_tau , M0 , M1 , M2);
-  
+
   // Transform some of our parameters
   Type sp_range = sqrt(8.0) / exp(log_kappa);
   Type sp_sigma = 1.0 / sqrt (4.0 * 3.14159265359 * exp(2.0*log_tau) * exp(2.0*log_kappa));
@@ -163,7 +167,12 @@ Type objective_function<Type>::operator() ()
   // normalization outside of every optimization step
     // not calculating the normalizing constant in the inner opt
     // that norm constant means taking an expensive determinant of Q_ss
-  jnll_comp(5) += GMRF(Q_ss , false )(Etainput_s);
+  int start_pl=0;
+  for(int iseas=0;iseas<n_seasons;iseas++){
+    jnll_comp(5) += GMRF(Q_ss , false )(Etainput_s.segment(start_pl,n_eta));
+    start_pl = start_pl+n_eta;
+  }
+
     // return without data ll contrib to avoid unneccesary log ( det (Q)) calcs
   if ( flag == 0) return jnll_comp(5);
 
@@ -174,43 +183,47 @@ Type objective_function<Type>::operator() ()
   matrix<Type> logPi_st(n_cells,n_tsteps);
   vector<Type> fixed_eff_s = X_s * Beta_s;  // time-invariant spline linear predictor
   vector<Type> linpredZ_st(n_cells);
-  vector<Type> RE(n_cells);
 
   Type cur_sum;
   Type small = 0.00000001;
+  int it=0;
+  vector<Type> RE(n_cells);
+  vector<Type> Eta_s(n_eta);
 
-  for(int is=0;is<n_cells;is++){
-    RE(is)=Etainput_s(Eta_index(is));
-  }
-
-  for(int it=0;it<n_tsteps;it++){
-    for(int is=0; is<n_cells; is++){
-      linpredZ_st(is) = fixed_eff_s(is)+RE(is);
-      for(int ib = 0; ib<n_b_ice; ib++){
-        linpredZ_st(is) += X_ice(is,ib,it)*Beta_ice(ib);
+  for(int iseas=0;iseas<n_seasons;iseas++){
+    start_pl = iseas*n_eta;
+    Eta_s = Etainput_s.segment(start_pl,n_eta);
+    RE = A * Eta_s;
+    for(int iyr = 0; iyr<n_yrs; iyr++){
+      it = iseas*n_yrs+iyr;
+      for(int is=0; is<n_cells; is++){
+        linpredZ_st(is) = fixed_eff_s(is)+RE(is);
+        for(int ib = 0; ib<n_b_ice; ib++){
+          linpredZ_st(is) += X_ice(is,ib,it)*Beta_ice(ib);
+        }
       }
-    }
-    cur_sum = 0;
-    for(int is=0; is<n_cells;is++){
-      Pi_st(is,it) = (1-Land_cover(is))*exp( linpredZ_st(is) ) + small;
-      cur_sum+=Pi_st(is,it);
-    }
-    for(int is=0; is<n_cells;is++){
-      Pi_st(is,it) = Pi_st(is,it)/cur_sum;
-      Z_st(is,it) = N*Pi_st(is,it);
-      logPi_st(is,it) = log(Pi_st(is,it));
-      logZ_st(is,it) = log_N + logPi_st(is,it);
+      cur_sum = 0;
+      for(int is=0; is<n_cells;is++){
+        Pi_st(is,it) = (1-Land_cover(is))*exp( linpredZ_st(is) ) + small;
+        cur_sum+=Pi_st(is,it);
+      }
+      for(int is=0; is<n_cells;is++){
+        Pi_st(is,it) = Pi_st(is,it)/cur_sum;
+        Z_st(is,it) = N*Pi_st(is,it);
+        logPi_st(is,it) = log(Pi_st(is,it));
+        logZ_st(is,it) = log_N + logPi_st(is,it);
+      }
     }
   }
 
   //UD observation process
-  // matrix<Type> Pi_st_mean_adj = Pi_st/mean_UD;
-  // for(int it=0; it<n_tsteps; it++){
-  //   for(int is=0; is<n_cells; is++){
-  //     jnll_comp(0)+=W_st(is,it)*pow(UD_mean_adj(is,it)-Pi_st_mean_adj(is,it),2.0);  // inv-var weighted sum of squares...
-  //   }
-  // }
-  // jnll_comp(0)=Wts(0)*jnll_comp(0);
+  matrix<Type> Pi_st_mean_adj = Pi_st/mean_UD;
+  for(int it=0; it<n_tsteps_UD; it++){
+    for(int is=0; is<n_cells; is++){
+      jnll_comp(0)+=W_st(is,it)*pow(UD_mean_adj(is,which_tsteps_UD(it))-Pi_st_mean_adj(is,which_tsteps_UD(it)),2.0);  // inv-var weighted sum of squares...
+    }
+  }
+  jnll_comp(0)=Wts(0)*jnll_comp(0);
 
   //ckmr observation process
   //jnll_comp(1) = -Wts(1)*dnorm(log_N,log_ckmr_N,log_ckmr_se,1);  //log likelihood - normal on log-scale
@@ -230,15 +243,15 @@ Type objective_function<Type>::operator() ()
 
   using namespace density;
 
-  int t_step1 = 8;  //corresponds to model time step associated with april/may 2012
-  int t_step2 = 9;  //corresponds to model time step associated with april/may 2013
-  int t_step3 = 12;  //corresponds to model time step associated with april/may 2016
-  int t_step4 = 17;  //corresponds to model time step associated with april/may 2021
+  int t_step1 = 16;  //corresponds to model time step associated with april/may 2012
+  int t_step2 = 18;  //corresponds to model time step associated with april/may 2013
+  int t_step3 = 24;  //corresponds to model time step associated with april/may 2016
+  int t_step4 = 34;  //corresponds to model time step associated with april/may 2021
   log_2012_se = log_2012_se*Wts(2);
   log_2013_se = log_2013_se*Wts(2);
   log_2016_se = log_2016_se*Wts(2);
   log_2021_se = log_2021_se*Wts(2);
-  
+
   for(int i=0; i<n_bering; i++){
     log_E_N_2012(i)=logZ_st(which_Bering(i),t_step1);
     log_E_N_2013(i)=logZ_st(which_Bering(i),t_step2);
@@ -256,10 +269,10 @@ Type objective_function<Type>::operator() ()
     chisq_aerial += pow(N_2016(i)-Z_st(which_Chukchi(i),t_step3),2.0)/Z_st(which_Chukchi(i),t_step3);
   }
   for(int i=0; i<n_beaufort; i++){
-    log_E_N_2021(i)=logZ_st(which_Beaufort(i),t_step4);
-    Z_score_2021(i) = (log_E_N_2021(i)-log_2021_N(i))/log_2021_se(i);
-    jnll_comp(2) -= dnorm(log_E_N_2021(i),log_2021_N(i),log_2021_se(i),1);
-    chisq_aerial += pow(N_2021(i)-Z_st(which_Beaufort(i),t_step3),2.0)/Z_st(which_Beaufort(i),t_step3);
+   log_E_N_2021(i)=logZ_st(which_Beaufort(i),t_step4);
+   Z_score_2021(i) = (log_E_N_2021(i)-log_2021_N(i))/log_2021_se(i);
+   jnll_comp(2) -= dnorm(log_E_N_2021(i),log_2021_N(i),log_2021_se(i),1);
+   chisq_aerial += pow(N_2021(i)-Z_st(which_Beaufort(i),t_step3),2.0)/Z_st(which_Beaufort(i),t_step3);
   }
 
   //acoustics
@@ -311,7 +324,7 @@ Type objective_function<Type>::operator() ()
   jnll = jnll_comp.sum();
 
   REPORT(jnll_comp);
-  //REPORT(Pi_st_mean_adj);
+  REPORT(Pi_st_mean_adj);
   REPORT(logPi_st);
   REPORT(Z_st);
   REPORT(N);
@@ -344,14 +357,13 @@ Type objective_function<Type>::operator() ()
   REPORT( sp_sigma );
   REPORT( sp_range );
   REPORT( Etainput_s );
-
+ 
   //std::cout<<"Range "<<Range_eta<<"\n";
-  // Bias correction output
   //ADREPORT(log_Z_s);
-  ADREPORT(N);
-  ADREPORT(Beta_s);
-  ADREPORT(Beta_ice);
-  ADREPORT(Beta_acc);
+  //ADREPORT(N);
+  //ADREPORT(Beta_s);
+  //ADREPORT(Beta_ice);
+  //ADREPORT(Beta_acc);
   
   return jnll;
 }

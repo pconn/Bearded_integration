@@ -26,12 +26,8 @@ which_Bering = which(grid_sf$Bering_2013_smoothed>=0)
 which_Chukchi = which(grid_sf$Chukchi_smoothed>0)
 which_Beaufort = which(grid_sf$JOBSS_smoothed>0)
 
-#Ice = Ice
-#n_season = ncol(Ice)
 Seasons = c(1:ncol(Ice))
-which_spring = which(Seasons%%5==2)
-Ice = Ice[,which_spring]
-n_season = ncol(Ice)  #now "n_season" is really the number of years, but keep consistency for when we put other seasons back in
+n_season = ncol(Ice)  #now "n_season" is really the number of years * # of seasons
 
 
 #we'll set proportion land = 0 for all cells for simulation testing...will want to incorporate
@@ -57,12 +53,11 @@ Acc_detect <- data.frame(Acc_detect)
 Acc_detect = Acc_detect[which(lubridate::year(Acc_detect[,"detection_dt"])<=yr_last),]
 
 Month = lubridate::month(Acc_detect[,"detection_dt"])
-Acc_detect$season = 1*(Month %in% c(1:3))+2*(Month %in% c(4:5))+3*(Month %in% c(6:7))+4*(Month %in% c(8:9))+5*(Month %in% c(10:12))
-#limit to spring
-Acc_detect = Acc_detect[which(Acc_detect$season==2),]
-#Acc_detect$tstep = (Year-2004)*5+Acc_detect$season
 Year = lubridate::year(Acc_detect[,"detection_dt"])
-Acc_detect$tstep=Year-2003  #2004 = time step 1
+Acc_detect$season = 1*(Month %in% c(1:3,12))+2*(Month %in% c(4:5))+3*(Month %in% c(6:7))+4*(Month %in% c(8:9))+5*(Month %in% c(10:11))
+Acc_detect$tstep = (Year-2004)*5+Acc_detect$season
+Acc_detect$tstep[which(Month==12)]=Acc_detect$tstep[which(Month==12)]+5 #need to put december with next year's time step
+#Acc_detect = Acc_detect[-which(Month==12 & Year==2020),]  # don't need this - there are no records from Dec 2020 (they go through Oct 2019)
 moorings_sf = st_transform(moorings_sf,st_crs(grid_sf))
 
 #take out any moorings not within estimation grid
@@ -70,9 +65,16 @@ InGrid = st_within(moorings_sf,st_union(grid_sf),sparse=FALSE)
 moorings_sf = moorings_sf[which(InGrid==TRUE),]
 Acc_detect = Acc_detect[which(Acc_detect$mooring_site_id %in% unique(moorings_sf$mooring_site_id_full)),]
 
-#take out any moorings without acoustic detections
+#take out any moorings without processed recordings
 Unique_moorings_det = unique(Acc_detect$mooring_site_id)
 moorings_sf = moorings_sf[which(moorings_sf$mooring_site_id_full %in% Unique_moorings_det),]
+
+
+#produce table of number of files per year by mooring
+Acc_df = as.data.frame(Acc_detect)
+Acc_df$year = lubridate::year(Acc_df$detection_dt)
+library(doBy)
+Acc_table = summaryBy(num_png_with_call~mooring_site_id+year,data=Acc_df,FUN=sum)
 
 #combine data from same mooring, time step combo
 Mooring_season_ID = paste(Acc_detect$mooring_site_id,Acc_detect$tstep)
@@ -139,24 +141,56 @@ for(idet in 1:n_det){
 
 # make acoustic calling rates vary by latitude, ice presence
 # call rate = exponential hazard
-#Acc_det_sum$season = factor(Acc_det_sum$season,levels=as.character(1:5))
+Acc_det_sum$season = factor(Acc_det_sum$season,levels=as.character(1:5))
 Acc_det_sum$ice2=Acc_det_sum$ice^2
-Acc_DM = model.matrix(~latitude+ice+ice2,data=Acc_det_sum)
+Acc_DM = model.matrix(~season*latitude+ice+ice2,data=Acc_det_sum)
 
-save.image('spring_no_UD_data.Rdata')
-load('spring_no_UD_data.Rdata')
+load("logUD_output.RData")
+
+#format UD data
+logUD = logUD_output$logUD
+Pi_UD = exp(logUD_output$logUD)
+Var_logUD = logUD_output$SE^2 
+for(i in 1:n_season)Pi_UD[,i]=Pi_UD[,i]/sum(Pi_UD[,i])
+UD_mean_adj = Pi_UD
+W_st = Pi_UD
+w_max = 10000  # we'll want to have a TMB option for this to prevent really high weights for zero predictions
+mean_UD = mean(Pi_UD)  #we'll standardize to mean to prevent numerical errors - need to account for this in objective function though!
+Index = c(1:n_cells)
+for(iseason in 1:n_season){
+  UD_mean_adj[,iseason] = Pi_UD[,iseason]/mean_UD
+  Cur_exp = exp(logUD[,iseason])
+  sumSq = (sum(Cur_exp))^2
+  Grad_trans = matrix(0,n_cells,n_cells)
+  for(is in 1:n_cells){
+    Grad_trans[is,is]=Cur_exp[is]*sum(Cur_exp[-is])
+    Off_diags = Index[-is]
+    for(is2 in 1:(n_cells-1)){
+      Grad_trans[is,Off_diags[is2]]= -Cur_exp[is]*Cur_exp[Off_diags[is2]]
+    }
+  }
+  Grad_trans = Grad_trans /sumSq
+  Var_UD = 1/mean_UD^2 * Grad_trans %*% diag(Var_logUD[,iseason]) %*% t(Grad_trans)
+  W_st[,iseason] = 1/diag(Var_UD)
+  if(sum(W_st[,iseason]>w_max)>0)W_st[which(W_st[,iseason]>w_max),iseason]=w_max
+}
+
+save.image('bearded_TMB_inputs_all_Dec23.RData')
+
+load('bearded_TMB_inputs_all_Dec23.RData')
 
 library( TMB )
 library(Matrix)
 library(mgcv)
 
-TmbFile1 = "C:/Users/paul.conn/git/Bearded_integration/Bearded_integration/src/fit_bearded_real_noUD_SPDE"
+TmbFile1 = "C:/Users/paul.conn/git/Bearded_integration/Bearded_integration/src/fit_bearded_real_all_SPDErr"
 compile(paste0(TmbFile1,".cpp"),"-O1 -g",DLLFLAGS="") 
 
 dyn.load( dynlib(TmbFile1) )
 
-#design matrix for spatial effects (omitting Ice) - we'll make this GAM style
 
+#design matrix for spatial effects (omitting Ice) - we'll make this GAM style
+grid_sf$depth[which(grid_sf$depth>0)]=0
 GAM_data = data.frame(Dummy=rep(1,nrow(grid_sf)),dist_land=grid_sf$dist_land,
                       depth=grid_sf$depth, easting = grid_sf$easting, northing=grid_sf$northing)
 
@@ -175,11 +209,11 @@ S_combined = as(S_combined,"generalMatrix")
 Sdims = unlist(lapply(S_list,nrow)) # Find dimension of each S
 
 #X_s = gam_setup$X[,-1]
-X_s = matrix(0,n_cells,4)  #use fixed effects set-up for debugging 
+X_s = matrix(0,n_cells,2)  #use fixed effects set-up for debugging 
 X_s[,1]=grid_sf$depth
 X_s[,2]=grid_sf$depth^2
-X_s[,3]=grid_sf$dist_land
-X_s[,4]=grid_sf$dist_land^2
+#X_s[,3]=grid_sf$dist_land
+#X_s[,4]=grid_sf$dist_land^2
 
 #For report, used for constructing plots----
 depth = seq(min(GAM_data$depth),max(GAM_data$depth),by = (max(GAM_data$depth)-min(GAM_data$depth))/100)
@@ -196,29 +230,37 @@ designMatrixForReport = list(depthReport,landReport,eastingReport,northingReport
 
 #set up SPDE basis using INLA
 # Create the SPDE/GMRF model, (kappa^2-Delta)(tau x) = W:
+# using a predictive process here; 1000 knots.
 library(INLA)
 Grid_locs = cbind(grid_sf$northing,grid_sf$easting) 
-colnames(Grid_locs) = c("y","x")
-mesh = inla.mesh.create( Grid_locs )
-n_knots = mesh$n
-Eta_index = mesh$idx$loc-1  #which spde REs to apply as random effects for each cell centroid
-spde <- (inla.spde2.matern(mesh, alpha=2)$param.inla)[c("M0","M1","M2")]
+knots <- stats::kmeans(x = Grid_locs, centers = 100)  # # knots will be more after triangulation
+loc_centers <- knots$centers
+mesh <- INLA::inla.mesh.create(loc_centers, refine = TRUE)
+spde <- INLA::inla.spde2.matern(mesh)  
+A <- INLA::inla.spde.make.A(mesh, loc = as.matrix(Grid_locs)) #prediction matrix
 
-#design matrices for Ice 
-X_ice = array(0,dim=c(n_cells,3,n_season)) 
+#design matrices for Ice - diff effects for each season
+Ice[which(Ice>1.0)]=1.0
+X_ice = array(0,dim=c(n_cells,15,n_season)) 
 for(is in 1:n_season){
-  cur_ice = data.frame("ice"=Ice[,is],"ice2"=Ice[,is]^2,"I_zero"=1*(Ice[,is]<0.01))
-  X_ice[,,is]=model.matrix(~0+ice+ice2+I_zero,data=cur_ice)
+  cur_seas = factor(as.character((is %% 5)+1),levels=c("1","2","3","4","5")) #actual season!
+  cur_ice = data.frame("ice"=Ice[,is],"ice2"=Ice[,is]^2,"I_zero"=1*(Ice[,is]<0.01),"season"=cur_seas)
+  X_ice[,,is]=model.matrix(~0+ice:season+ice2:season+I_zero:season,data=cur_ice)
 }
 
-wt_ud = 1  #above 1 increases ud influence
-wt_ckmr = 1  #above 1 decreases ckmr influence
+wt_ud = 0.2  #above 1 increases ud influence
+wt_ckmr = 4020  #above 1 decreases ckmr influence
 wt_aerial = 1 #above 1 decreaes aerial influence
-wt_acc=0.0005  # above 1 increases acoustic influence; .0005 justified bassed on initial fits and chi-sq lack-of-fit adjustment
+wt_acc=0.00005  # above 1 increases acoustic influence; .00005 justified based on initial fits and chi-sq lack-of-fit adjustment
 wt_spline =1
 wt_spde=1
 
-w_max = 1
+# wt_ud = .07  #above 1 increases ud influence
+# wt_ckmr = 1  #above 1 decreases ckmr influence
+# wt_aerial = 67 #above 1 decreases aerial influence
+# wt_acc=0.0005  # above 1 increases acoustic influence; .0005 justified bassed on initial fits and chi-sq lack-of-fit adjustment
+# wt_spline =1
+# wt_spde=1
 
 low = -10
 #high = abs(low)/4  #so low values will have SE's that make high counts imporobabe
@@ -244,13 +286,24 @@ log_2016_SE[log_2016_SE>high]=high
 log_2021_SE[log_2021_SE>high]=high
 
 
-#NOTE: I temporarily changed log_2012_VC_inv etc. so as not to have to repeat matrix inverse every sim
+load("BD_telem_m_y_table.RData")
+Points_s_y = matrix(0,15,5)
+Points_s_y[,1]=rowSums(Points_m_y[,1:3])
+Points_s_y[,2]=rowSums(Points_m_y[,4:5])
+Points_s_y[,3]=rowSums(Points_m_y[,6:7])
+Points_s_y[,4]=rowSums(Points_m_y[,8:9])
+Points_s_y[,5]=rowSums(Points_m_y[,10:11])
+Points_s_y[2:15,1]=Points_s_y[2:15,1]+Points_m_y[1:14,12] #adding in december to next year's season 1
+
+Which_tsteps_UD = which(t(Points_s_y)>0)
+
+#nb: 5 seasons/yr hardwired in Data and Params
 Data<- list("Acc_k"=as.matrix(Acc_det_sum[,c(2,4,6,8,10)]), 
             "Acc_n"=as.matrix(Acc_det_sum[,c(3,5,7,9,11)]),
             "Area_acc"=Area_acc,"X_acc"=Acc_DM,
             "Acc_tstep"=Acc_det_sum$tstep-1,
             "log_ckmr_N" = log(N_ckmr), "log_ckmr_se"=log_ckmr_se,
-            #"UD_mean_adj" = UD_mean_adj, "mean_UD" = mean_UD, "W_st" = W_st,
+            "UD_mean_adj" = UD_mean_adj, "mean_UD" = mean_UD, "which_tsteps_UD" = Which_tsteps_UD-1,"W_st" = W_st,
             "which_Chukchi"=which_Chukchi-1, "which_Bering"=which_Bering-1, "which_Beaufort"=which_Beaufort-1,
             "log_2012_N" = log_2012_N, "log_2013_N"=log_2013_N,"log_2016_N"=log_2016_N,"log_2021_N"=log_2021_N,
             "log_2012_se" = log_2012_SE,"log_2013_se" = log_2013_SE,"log_2016_se" = log_2016_SE,"log_2021_se"=log_2021_SE,
@@ -259,15 +312,15 @@ Data<- list("Acc_k"=as.matrix(Acc_det_sum[,c(2,4,6,8,10)]),
             "designMatrixForReport"=.bdiag(designMatrixForReport), "S" = S_combined, "Sdims"=Sdims,
             "Wts" = c(wt_ud, wt_ckmr, wt_aerial, wt_acc, wt_spline,wt_spde),"n_tsteps"=n_season,
             "Duty_lengths"=c(30,60,90,120,180),"est_acc"=1,
-            "M0"=spde$M0,"M1"=spde$M1,"M2"=spde$M2,
-            "Eta_index"=Eta_index,"options"=c(0,0),n_eta=n_knots,flag=1
+            "M0"=spde$param.inla$M0,"M1"=spde$param.inla$M1,"M2"=spde$param.inla$M2,
+            "A"=A,"options"=c(0,0),n_eta=ncol(A),n_seasons=5,flag=1
 )
 
 
 Params = list("log_N"=log(500000),"Beta_s" = rep(0,ncol(X_s)),"Beta_ice" = rep(0,ncol(X_ice[,,1])),
               "Beta_acc"=rep(0,ncol(Acc_DM)),
               "log_lambda" = rep(0,length(Sdims)),"log_tau"=0, "log_kappa"=0,
-               "Etainput_s"=rep(0,n_knots)
+               "Etainput_s"=rep(0,5*ncol(A))
 )
 
 
@@ -276,33 +329,104 @@ Params$Beta_acc[1] = -9  #needs to start low to prevent numerical issues
 Random <- ("Etainput_s")
 #Random <- c("Beta_s","log_lambda")
 #Random <- NULL
-Map <- list(log_lambda=factor(rep(NA,length(Sdims))))
+Map <- list(log_lambda=factor(rep(NA,length(Sdims))),
+            Etainput_s = factor(rep(NA,5*ncol(A))),
+            log_tau = factor(NA),log_kappa = factor(NA)
+            )
 #Map=NULL
 
-Obj = MakeADFun( data=Data, parameters=Params, random=Random, map=Map, DLL="fit_bearded_real_noUD_SPDE",silent=FALSE)
+Obj = MakeADFun( data=Data, parameters=Params, random=Random, map=Map, DLL="fit_bearded_real_all_SPDErr",silent=FALSE)
 Obj$fn( Obj$par )
 Obj <- normalize ( Obj , flag ="flag", value = 0)
 Lower = -50  #trying to prevent -Inf,Inf bounds resulting in nlminb failure (NaN gradient)
 Upper = 50
-Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr, lower=Lower, upper=Upper, control=list(trace=1, eval.max=10000, iter.max=10000))         #
+Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr, lower=Lower, upper=Upper, control=list(trace=1, eval.max=100000, iter.max=100000))         #
+Report = Obj$report()
+Opt$message
+Report0 = Report
+
+Map <- list(log_lambda=factor(rep(NA,length(Sdims)))#,
+            #Etainput_s = factor(rep(NA,ncol(A))),
+            #log_tau = factor(NA),log_kappa = factor(NA)
+)
+
+init_time <- Sys.time()
+
+Params$log_N=log(Report$N)
+Params$Beta_s = Report$Beta_s
+Params$Beta_ice = Report$Beta_ice
+Params$Beta_acc = Report$Beta_acc
+Obj = MakeADFun( data=Data, parameters=Params, random=Random, map=Map, DLL="fit_bearded_real_all_SPDErr",silent=FALSE)
+Obj$fn( Obj$par )
+Obj <- normalize ( Obj , flag ="flag", value = 0)
+Lower = -50  #trying to prevent -Inf,Inf bounds resulting in nlminb failure (NaN gradient)
+Upper = 50
+Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr, lower=Lower, upper=Upper, control=list(trace=1, eval.max=100000, iter.max=100000))         #
 Report = Obj$report()
 Opt$message
 Report1 = Report
 
-save.image('bearded_SPDE_results.RData')
 
-N_est[isim]=Report$N
+end_time <- Sys.time()
+end_time - init_time
+
+save.image('bearded_SPDErr_results_all_dec2023.RData')
 
 Z_cat = c(Report$Z_score_2012,Report$Z_score_2013,Report$Z_score_2016)
 prop_gt_90 = sum(abs(Z_cat)>1.64)/length(Z_cat)
 
+wt_ud = .6  #above 1 increases ud influence
+wt_ckmr = 1  #above 1 decreases ckmr influence
+wt_aerial = 5 #above 1 decreases aerial influence (the value of 5 is justified by examining variance ratios of Var(N) to Var(sum(Z)) )
+wt_acc=0.0005  # above 1 increases acoustic influence; .0005 justified based on initial fits and chi-sq lack-of-fit adjustment
+wt_spline =1
+wt_spde=1
+Data$Wts = c(wt_ud, wt_ckmr, wt_aerial, wt_acc, wt_spline,wt_spde)
 
+Params$log_N = log(500000)
+Params$Beta_s = Report$Beta_s
+Params$Beta_ice = Report$Beta_ice
+Params$Beta_acc = Report$Beta_acc
+Params$log_lambda = log(Report$lambda)
+Params$log_tau = Report$log_tau
+Params$log_kappa = Report$log_kappa
+Params$Etainput_s = Report$Etainput_s
+
+init_time <- Sys.time()
+Obj = MakeADFun( data=Data, parameters=Params, random=Random, map=Map, DLL="fit_bearded_real_UD_SPDErr",silent=FALSE)
+Obj$fn( Obj$par )
+Obj <- normalize ( Obj , flag ="flag", value = 0)
+Lower = -50  #trying to prevent -Inf,Inf bounds resulting in nlminb failure (NaN gradient)
+Upper = 50
+Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr, lower=Lower, upper=Upper, control=list(trace=1, eval.max=100000, iter.max=100000))         #
+Report = Obj$report()
+Opt$message
+Report1 = Report
+end_time <- Sys.time()
+end_time - init_time
+
+save.image('bearded_SPDErr_results2.RData')
+
+Z_cat = c(Report$Z_score_2012,Report$Z_score_2013,Report$Z_score_2016)
+prop_gt_90 = sum(abs(Z_cat)>1.64)/length(Z_cat)
+72270/Report$jnll_comp[1]  #supposed UD weight adjustment
 # 
 n_iter = 4
+N_history = rep(0,n_iter+1)
+N_history[1]=Report$N
+
 Wts_history = matrix(0,n_iter+1,5)
 Wts_history[1,]=Data$Wts
 for(i in 1:n_iter){
-  Data$Wts[1]=Data$Wts[1]*301425/Report$jnll_comp[1]
+  Params$log_N = Report$log_N
+  Params$Beta_s = Report$Beta_s
+  Params$Beta_ice = Report$Beta_ice
+  Params$Beta_acc = Report$Beta_acc
+  Params$log_lambda = Report$log_lambda
+  Params$log_tau = Report$log_tau
+  Params$log_kappa = Report$log_kappa
+  Params$Etainput_s = Report$Etainput_s
+  Data$Wts[1]=Data$Wts[1]*72270/Report$jnll_comp[1]
   #Data$Wts[3]=Data$Wts[3]*5792/Report$jnll_comp[3]
   if(Data$Wts[3]<0.09 | Data$Wts[3]>0.11)Data$Wts[3] = Data$Wts[3]*(0.2+prop_gt_90)/0.3
   Data$Wts[4]=Data$Wts[4]*905/Report$chisq_acc
@@ -313,6 +437,7 @@ for(i in 1:n_iter){
   Upper = 50
   Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr, lower=Lower, upper=Upper, control=list(trace=1, eval.max=10000, iter.max=10000))         #
   Report = Obj$report()
+  N_history[i+1]=Report$N
   Z_cat = c(Report$Z_score_2012,Report$Z_score_2013,Report$Z_score_2016)
   prop_gt_90 = sum(abs(Z_cat)>1.64)/length(Z_cat)
   
@@ -325,7 +450,7 @@ for(i in 1:n_iter){
 
 library(ggplot2)
 png('Est_2012.png')
-grid_sf$N = Report$Z_st[,9]
+grid_sf$N = Report$Z_st[,45]
 #grid_sf$N1[which(grid_sf$N1>1000)]=1000
 ggplot(grid_sf)+geom_sf(aes(fill=N),color=NA)+theme(axis.text=element_blank())
 dev.off()
@@ -345,6 +470,8 @@ Data$N_2012[Which_high_z]
 ggplot(grid_sf)+geom_sf(aes(fill=Bering_2012),color=NA)
 
 ggplot(grid_sf)+geom_sf(aes(fill=Bering_2013),color=NA)
+
+ggplot(grid_sf)+geom_sf(aes(fill=JOBSS_smoothed),color=NA)
 
 #plot acoustic effects
 Ice_conc = c(0:100)/100

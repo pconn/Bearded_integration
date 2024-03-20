@@ -317,8 +317,8 @@ library(cowplot)
 start_yr = 2004
 end_yr = 2021
 n_yrs = end_yr-start_yr+1
-season_start = c("12-01","04-01","06-01","08-01","10-01")
-season_end = c("03-31","05-31","07-31","09-30","11-30")
+season_start = c("12-01","06-01")
+season_end = c("05-31","11-30")
 n_seasons = length(season_end)
 t_steps = n_seasons * n_yrs
 
@@ -342,7 +342,26 @@ for(iyr in 1:n_yrs){
   }
 }
 
-save.image(file='analysis_grid_ice_attached.RData')
+### now do ice by month for acoustics
+t_steps_mo = 12 * n_yrs
+month_start = c("01-01","02-01","03-01","04-01","05-01","06-01","07-01","08-01","09-01","10-01","11-01","12-01")
+month_end = c("01-30","02-28","03-31","04-30","05-31","06-30","07-31","08-30","09-30","10-31","11-30","12-31")
+
+### average sea ice concentration values by cell, year, month
+start_date_mo = end_date_mo = rep('NA',t_steps_mo)
+Ice_mo = matrix(NA,n_cells,t_steps_mo)
+for(iyr in 1:n_yrs){
+  for(imonth in 1:12){
+    date1 = paste0(iyr+start_yr,'-',month_start[imonth])
+    date2 = paste0(iyr+start_yr,'-',month_end[imonth])
+    Temp_ice = sea_ice[which(sea_ice$fdate>=date1 & sea_ice$fdate<=date2),]
+    for(icell in 1:n_cells){
+      Ice_mo[icell,12*(iyr-1)+imonth] <- mean(Temp_ice[which(Temp_ice$cell==Cell_IDs[icell]),"rast_seaice"],na.rm=TRUE)
+    }
+  }
+}
+
+save.image(file='analysis_grid_ice_attached_2season.RData')
 
 #krige ice data
 library(automap)
@@ -361,13 +380,27 @@ for(iyr in 1:n_yrs){
   }
 }
 
-save.image(file='prediction_grid_ice_kriged.RData')
+for(iyr in 1:n_yrs){
+  for(imonth in 1:12){
+    grid_sp$ice = Ice_mo[,12*(iyr-1)+imonth]
+    Which_problem = which(Ice_mo[,12*(iyr-1)+imonth]>1.0 | grid_sf$land_cover>0.01)
+    fit_points = grid_sp[-Which_problem,]
+    pred_points = grid_sp[Which_problem,]
+    krige_out=autoKrige(ice~1,input_data=fit_points,new_data=pred_points)$krige_output[["var1.pred"]] 
+    if(sum(krige_out<0)>0){
+      krige_out[which(krige_out<0)]=0
+    }
+    Ice_mo[Which_problem,12*(iyr-1)+imonth]=krige_out
+  }
+}
+
+save.image(file='prediction_grid_ice_kriged_2season.RData')
 
 
 #plot showing seasonal variability between years
-Plots = vector("list",5)  #season on first level
+Plots = vector("list",2)  #season on first level
 Years = c(1,6,11,15)
-for(is in 1:5){
+for(is in 1:2){
   Plots[[is]]=vector("list",4) 
   for(iyr in 1:4){
     grid_sf$ice = Ice[,n_seasons*(Years[iyr]-1)+is]
@@ -379,10 +412,10 @@ for(is in 1:5){
 #now, cowplot
 
 #plot with 
-png("Ice_maps.png")
-plot_grid(Plots[[1]][[1]],Plots[[1]][[2]],Plots[[1]][[3]],Plots[[1]][[4]],
-          Plots[[2]][[1]],Plots[[2]][[2]],Plots[[2]][[3]],Plots[[2]][[4]],
-          ncol=4)
+png("Ice_maps_2season.png",width=8,height=8,units="in",res=600)
+plot_grid(Plots[[1]][[1]],Plots[[2]][[1]],Plots[[1]][[2]],Plots[[2]][[2]],
+          Plots[[1]][[3]],Plots[[2]][[3]],Plots[[1]][[4]],Plots[[2]][[4]],
+          ncol=2)
 dev.off()
 
 
